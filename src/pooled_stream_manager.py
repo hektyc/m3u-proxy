@@ -141,6 +141,16 @@ class SharedTranscodingProcess:
                             ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"])
                         # Disable extension checking to allow extensionless segment URLs
                         processed_args.extend(["-extension_picky", "false"])
+                        # Reduce input probing to speed up stream start and prevent buffering
+                        processed_args.extend(["-probesize", "32768", "-analyzeduration", "1000000"])
+                        # NOTE: Do NOT add -re flag for HLS input when output is also HLS
+                        # The -re flag causes VBV underflow with HLS muxer because:
+                        # 1. HLS input is already real-time
+                        # 2. HLS muxer buffers segments before writing
+                        # 3. -re + HLS buffering = double throttling = encoder can't maintain CBR
+                        # Only add -re for non-HLS output formats (MPEG-TS, etc.)
+                        if self.mode != 'hls':
+                            processed_args.extend(["-re"])
                     # Add -i flag and use self.url as the input
                     processed_args.append(arg)
                     # Use current URL (updated during failover)
@@ -177,6 +187,62 @@ class SharedTranscodingProcess:
 
             # If HLS mode, ensure we write to the hls_dir index.m3u8
             if self.mode == 'hls':
+                # Apply LL-HLS optimizations if enabled
+                ll_hls_enabled = os.getenv('LL_HLS_ENABLED', 'false').lower() == 'true'
+                if ll_hls_enabled:
+                    logger.info(f"LL-HLS optimizations enabled for stream {self.stream_id}")
+
+                    # Check if HLS options are already in the command
+                    has_hls_time = any('-hls_time' in str(arg) for arg in ffmpeg_cmd)
+                    has_hls_list_size = any('-hls_list_size' in str(arg) for arg in ffmpeg_cmd)
+                    has_hls_flags = any('-hls_flags' in str(arg) for arg in ffmpeg_cmd)
+                    has_hls_segment_type = any('-hls_segment_type' in str(arg) for arg in ffmpeg_cmd)
+                    has_g = any(str(arg) == '-g' for arg in ffmpeg_cmd)
+                    has_sc_threshold = any('-sc_threshold' in str(arg) for arg in ffmpeg_cmd)
+
+                    # Only add LL-HLS options if they're not already present
+                    ll_hls_options = []
+
+                    if not has_hls_time:
+                        segment_duration = int(os.getenv('LL_HLS_SEGMENT_DURATION', '2'))
+                        ll_hls_options.extend(['-hls_time', str(segment_duration)])
+
+                    if not has_hls_list_size:
+                        playlist_size = int(os.getenv('LL_HLS_PLAYLIST_SIZE', '10'))
+                        ll_hls_options.extend(['-hls_list_size', str(playlist_size)])
+
+                    if not has_hls_flags:
+                        # Build HLS flags
+                        hls_flags = ['program_date_time']
+                        if os.getenv('LL_HLS_DELETE_SEGMENTS', 'false').lower() == 'true':
+                            hls_flags.append('delete_segments')
+                        if os.getenv('LL_HLS_INDEPENDENT_SEGMENTS', 'true').lower() == 'true':
+                            hls_flags.append('independent_segments')
+                        ll_hls_options.extend(['-hls_flags', '+'.join(hls_flags)])
+
+                    if not has_hls_segment_type:
+                        segment_type = os.getenv('LL_HLS_SEGMENT_TYPE', 'mpegts')
+                        ll_hls_options.extend(['-hls_segment_type', segment_type])
+
+                    if not has_g:
+                        gop_size = int(os.getenv('LL_HLS_GOP_SIZE', '60'))
+                        ll_hls_options.extend(['-g', str(gop_size)])
+
+                    if not has_sc_threshold:
+                        ll_hls_options.extend(['-sc_threshold', '0'])
+
+                    # Insert LL-HLS options before the output file
+                    # Find the last occurrence of an option flag (starts with -)
+                    insert_pos = len(ffmpeg_cmd)
+                    for i in range(len(ffmpeg_cmd) - 1, -1, -1):
+                        if isinstance(ffmpeg_cmd[i], str) and ffmpeg_cmd[i].startswith('-'):
+                            insert_pos = i
+                            break
+
+                    # Insert LL-HLS options at the found position
+                    for opt in reversed(ll_hls_options):
+                        ffmpeg_cmd.insert(insert_pos, opt)
+
                 # If the ffmpeg args already include an output filename, respect it
                 # Otherwise append the playlist target into the hls dir
                 playlist_path = os.path.join(
