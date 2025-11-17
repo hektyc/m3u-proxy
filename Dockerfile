@@ -9,8 +9,9 @@ RUN apt-get update && apt-get install -y \
     curl \
     # Python dependencies
     python3 \
-    py3-pip \
-    py3-virtualenv
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
