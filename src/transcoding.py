@@ -37,6 +37,10 @@ class TranscodingProfile:
         # Replace template variables with default value support
         import re
 
+        # Track substitutions for logging
+        substitutions = []
+        unsubstituted = []
+
         # First, handle variables with default values: {key|default}
         def replace_with_default(match):
             full_match = match.group(0)  # Full {key|default} or {key}
@@ -44,17 +48,32 @@ class TranscodingProfile:
             default_value = match.group(2)  # The default value (if any)
 
             if var_name in variables:
-                return str(variables[var_name])
+                value = str(variables[var_name])
+                substitutions.append(f"  {full_match} → {value} (provided)")
+                return value
             elif default_value is not None:
+                substitutions.append(f"  {full_match} → {default_value} (default)")
                 return default_value
             else:
                 # Keep the placeholder if no value and no default
+                unsubstituted.append(full_match)
                 return full_match
 
         # Pattern to match {variable} or {variable|default}
         pattern = r'\{([^}|]+)(?:\|([^}]*))?\}'
         rendered_params = re.sub(
             pattern, replace_with_default, rendered_params)
+
+        # Log substitution details
+        if substitutions or unsubstituted:
+            logger.info(f"Profile '{self.name}' variable substitution:")
+            for sub in substitutions:
+                logger.info(sub)
+
+            if unsubstituted:
+                logger.warning(f"Unsubstituted variables in profile '{self.name}': {', '.join(unsubstituted)}")
+                logger.warning("These variables will appear literally in the FFmpeg command and may cause transcoding failures.")
+                logger.warning("Check your profile configuration in m3u-editor or provide values when calling the profile.")
 
         # Split into arguments (respecting quotes)
         args = []
