@@ -1,12 +1,8 @@
-FROM alpine:3.21.3
+FROM linuxserver/ffmpeg:latest
 
-# Install FFmpeg 8.0 from Alpine edge and system dependencies
-RUN echo "@edge https://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories && \
-    echo "@edge https://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories && \
-    apk update && apk --no-cache add \
-    # FFmpeg 8.0 from Alpine edge
-    ffmpeg@edge \
-    # Common utilities
+# Install Python and system dependencies
+RUN apt-get update && apt-get install -y \
+    # Add common utilities
     pciutils \
     wget \
     nano \
