@@ -1,14 +1,18 @@
 from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends, Header
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.openapi.docs import get_swagger_ui_html
 from contextlib import asynccontextmanager
 import logging
 import uuid
 import hashlib
+import subprocess
 from urllib.parse import unquote, urlparse
 from typing import Optional, List, Dict
 from pydantic import BaseModel, field_validator, ValidationError
 from datetime import datetime, timezone
+import os
 
 from stream_manager import StreamManager
 from events import EventManager
@@ -21,6 +25,25 @@ from hwaccel import hw_accel
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def get_ffmpeg_version() -> Optional[str]:
+    """Get the ffmpeg version string"""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-version'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            # Extract the version from first line (e.g., "ffmpeg version 4.4.2")
+            first_line = result.stdout.split('\n')[0]
+            return first_line.strip()
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+        logger.warning(f"Failed to get ffmpeg version: {e}")
+        return None
 
 
 def get_content_type(url: str) -> str:
@@ -59,13 +82,31 @@ def detect_https_from_headers(request: Request) -> bool:
     - NGINX Proxy Manager, Tailscale, Headscale, Netbird, etc.
 
     Returns True if HTTPS is detected, False otherwise.
+
+    IMPORTANT: Only trusts forwarded headers if the request came through a reverse proxy.
+    If the client connects directly (no X-Forwarded-For), use the actual request scheme.
     """
     # Debug logging (disabled by default - enable if needed for troubleshooting)
     # logger.debug("=" * 80)
-    # logger.debug("🔍 DEBUG: ALL HEADERS RECEIVED BY m3u-proxy:")
+    # logger.debug("🔍 DEBUG: ALL HEADERS RECEIVED BY m3u proxy:")
     # for header_name, header_value in request.headers.items():
     #     logger.debug(f"  {header_name}: {header_value}")
     # logger.debug("=" * 80)
+
+    # First check: Is this a direct connection or through a reverse proxy?
+    # If X-Forwarded-For is NOT present, the client connected directly to us
+    has_forwarded_for = request.headers.get("x-forwarded-for") is not None
+
+    if not has_forwarded_for:
+        # Direct connection - use the actual request scheme, ignore forwarded headers
+        # These headers might be set by a previous layer but don't represent THIS connection
+        actual_scheme = request.url.scheme
+        is_https = actual_scheme == "https"
+        logger.debug(
+            f"🔌 Direct connection detected (no X-Forwarded-For) - using actual scheme: {actual_scheme}")
+        return is_https
+
+    # Request came through a reverse proxy - trust the forwarded headers
 
     # Check X-Forwarded-Proto (most common - NGINX, Caddy, Traefik, NPM)
     forwarded_proto = request.headers.get("x-forwarded-proto")
@@ -188,7 +229,8 @@ class StreamCreateRequest(BaseModel):
     user_agent: Optional[str] = None
     metadata: Optional[dict] = None
     headers: Optional[Dict[str, str]] = None
-    strict_live_ts: Optional[bool] = None  # Enable Strict Live TS Mode for this stream
+    # Enable Strict Live TS Mode for this stream
+    strict_live_ts: Optional[bool] = None
 
     @field_validator('url')
     @classmethod
@@ -285,7 +327,7 @@ event_manager = EventManager()
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
     # Startup
-    logger.info("m3u-proxy starting up...")
+    logger.info("m3u proxy starting up...")
     await event_manager.start()
 
     # Connect event manager to stream manager
@@ -305,23 +347,34 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
-    logger.info("m3u-proxy shutting down...")
+    logger.info("m3u proxy shutting down...")
     await stream_manager.stop()
     await event_manager.stop()
 
 
 app = FastAPI(
-    title="m3u-proxy",
+    title="m3u proxy",
     version=VERSION,
     description="Advanced IPTV streaming proxy with client management, stats, and failover support",
     lifespan=lifespan,
     root_path=settings.ROOT_PATH if hasattr(settings, 'ROOT_PATH') else "",
-    docs_url=settings.DOCS_URL if hasattr(settings, 'DOCS_URL') else "/docs",
+    docs_url=None,  # We'll create a minimal custom docs with logo/favicon
+    # docs_url=settings.DOCS_URL if hasattr(settings, 'DOCS_URL') else "/docs",
     redoc_url=settings.REDOC_URL if hasattr(
         settings, 'REDOC_URL') else "/redoc",
     openapi_url=settings.OPENAPI_URL if hasattr(
         settings, 'OPENAPI_URL') else "/openapi.json",
 )
+
+# Mount static files for logo and favicon
+# Get the parent directory of src/ to access root-level static files
+static_path = os.path.join(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))), "static")
+# If static directory doesn't exist in the expected location, try the actual root
+if not os.path.exists(static_path):
+    static_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+app.mount("/static", StaticFiles(directory=static_path), name="static")
 
 # Configure CORS to allow all origins for streaming compatibility
 app.add_middleware(
@@ -332,6 +385,71 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
     expose_headers=["*"],  # Expose all headers to the client
 )
+
+
+# Minimal custom Swagger UI with logo and favicon
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    """Minimal custom Swagger UI with logo and favicon"""
+    return HTMLResponse(f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{app.title}</title>
+    <link rel="icon" type="image/svg+xml" href="{app.root_path}/static/favicon.svg">
+    <link rel="icon" type="image/png" href="{app.root_path}/static/favicon.png">
+    <link rel="shortcut icon" href="{app.root_path}/static/favicon.ico">
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+    <style>
+        .topbar {{ display: none; }}
+        .swagger-ui .info .title {{ display: flex; align-items: center; gap: 15px; }}
+        .custom-logo {{ height: 45px; width: auto; }}
+    </style>
+</head>
+<body>
+    <div id="swagger-ui"></div>
+    <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+    const ui = SwaggerUIBundle({{
+        url: '{app.root_path}{app.openapi_url}',
+        dom_id: '#swagger-ui',
+        deepLinking: true,
+        showExtensions: true,
+        showCommonExtensions: true,
+        presets: [
+            SwaggerUIBundle.presets.apis,
+            SwaggerUIBundle.SwaggerUIStandalonePreset
+        ],
+        layout: "BaseLayout",
+        onComplete: function() {{
+            const title = document.querySelector('.info .title');
+            if (title && !document.querySelector('.custom-logo')) {{
+                const logo = document.createElement('img');
+                logo.src = '{app.root_path}/static/logo.svg';
+                logo.alt = '{app.title}';
+                logo.className = 'custom-logo';
+                title.insertBefore(logo, title.firstChild);
+            }}
+        }}
+    }});
+    </script>
+</body>
+</html>
+    """)
+
+
+# Serve favicon directly at root for browsers
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Serve favicon for browsers"""
+    favicon_path = os.path.join(static_path, "favicon.ico")
+    if os.path.exists(favicon_path):
+        return FileResponse(favicon_path)
+    # Fallback to SVG if ICO doesn't exist
+    favicon_svg = os.path.join(static_path, "favicon.svg")
+    if os.path.exists(favicon_svg):
+        return FileResponse(favicon_svg, media_type="image/svg+xml")
+    raise HTTPException(status_code=404, detail="Favicon not found")
 
 
 def get_client_info(request: Request):
@@ -347,7 +465,7 @@ def get_client_info(request: Request):
     elif request.client:
         # Fallback to direct connection IP
         ip_address = request.client.host
-    
+
     return {
         "user_agent": request.headers.get("user-agent") or "unknown",
         "ip_address": ip_address
@@ -399,7 +517,7 @@ async def root():
     proxy_stats = stats["proxy_stats"]
     return {
         "status": "running",
-        "message": "m3u-proxy is running",
+        "message": "m3u proxy is running",
         "version": VERSION,
         "uptime": proxy_stats["uptime_seconds"],
         "stats": proxy_stats
@@ -409,7 +527,7 @@ async def root():
 @app.get("/info", dependencies=[Depends(verify_token)])
 async def get_info():
     """
-    Get comprehensive information about the m3u-proxy server configuration and capabilities.
+    Get comprehensive information about the m3u proxy server configuration and capabilities.
     Includes hardware acceleration status, Redis pooling, transcoding profiles, and other details.
     """
     redis_config = get_redis_config()
@@ -419,6 +537,7 @@ async def get_info():
     # Build the info response
     info = {
         "version": VERSION,
+        "ffmpeg_version": get_ffmpeg_version(),
         "hardware_acceleration": {
             "enabled": hw_accel.is_available(),
             "type": hw_accel.get_type(),
@@ -782,7 +901,8 @@ async def get_hls_playlist(
 
         if public_url:
             # If PUBLIC_URL includes a scheme, respect it. Otherwise assume http.
-            public_with_scheme = public_url if public_url.startswith(('http://', 'https://')) else f"http://{public_url}"
+            public_with_scheme = public_url if public_url.startswith(
+                ('http://', 'https://')) else f"http://{public_url}"
             parsed = urlparse(public_with_scheme)
             scheme = parsed.scheme or 'http'
 
@@ -850,7 +970,7 @@ async def get_hls_playlist(
         # Check if this is a transcoded stream for logging purposes
         stream_info = stream_manager.streams.get(stream_id)
         stream_type = "transcoded HLS" if stream_info and stream_info.is_transcoded else "direct HLS"
-        
+
         logger.info(
             f"Serving {stream_type} playlist to client {client_id} for stream {stream_id}")
 
@@ -1052,7 +1172,7 @@ async def head_direct_stream(
         None, description="Client ID (auto-generated if not provided)")
 ):
     """Handle HEAD requests for direct streams (needed for MP4 duration/seeking)
-    
+
     In Strict Live TS Mode, this returns quickly without upstream hits for live TS streams.
     """
     try:
@@ -1074,7 +1194,7 @@ async def head_direct_stream(
         if strict_mode_enabled and stream_info.is_live_continuous:
             logger.info(
                 f"STRICT MODE: HEAD request for live TS stream {stream_id} - returning quick response without upstream hit")
-            
+
             response_headers = {
                 "Content-Type": content_type,
                 "Accept-Ranges": "none",  # Live streams don't support ranges
@@ -1087,7 +1207,7 @@ async def head_direct_stream(
                 "Access-Control-Expose-Headers": "*",
                 "Connection": "keep-alive"
             }
-            
+
             # Do NOT include Content-Length for live streams
             return Response(
                 content=None,
@@ -1437,10 +1557,10 @@ async def trigger_failover(stream_id: str):
             raise HTTPException(status_code=404, detail="Stream not found")
 
         stream_info = stream_manager.streams[stream_id]
-        
+
         if not stream_info.failover_urls:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail="No failover URLs configured for this stream"
             )
 
