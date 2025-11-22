@@ -16,9 +16,58 @@ services:
       - HOST=0.0.0.0
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     restart: unless-stopped
+    
+    # ============================================================================
+    # HARDWARE ACCELERATION CONFIGURATION
+    # ============================================================================
+    # Uncomment the appropriate section below to enable GPU hardware acceleration
+    # for FFmpeg transcoding. This can significantly improve performance and
+    # reduce CPU usage for live streaming and VOD transcoding.
+    #
+    # IMPORTANT: Only uncomment ONE section at a time based on your GPU type.
+    # ============================================================================
+    
+    # ----------------------------------------------------------------------------
+    # INTEL / AMD GPU HARDWARE ACCELERATION (VAAPI / QuickSync)
+    # ----------------------------------------------------------------------------
+    # For Intel QuickSync (QSV) or AMD VAAPI hardware acceleration.
+    # Requires: Intel iGPU (gen5+) or AMD GPU with VAAPI support
+    #
+    # Uncomment the lines below to enable:
+    # ----------------------------------------------------------------------------
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - video    # GID 44 - required for GPU access
+    #   - render   # GID 18 - required for GPU rendering access
+    # environment:
+    #   # For Intel gen8+ (Broadwell and newer), use iHD driver:
+    #   - LIBVA_DRIVER_NAME=iHD
+    #   # For Intel gen5-gen9.5 (older than Broadwell), use i965 driver:
+    #   # - LIBVA_DRIVER_NAME=i965
+    #   # For AMD GPUs, you can omit LIBVA_DRIVER_NAME or set it to radeonsi
+    
+    # ----------------------------------------------------------------------------
+    # NVIDIA GPU HARDWARE ACCELERATION (NVENC / NVDEC)
+    # ----------------------------------------------------------------------------
+    # For NVIDIA NVENC/NVDEC hardware acceleration.
+    # Requires: NVIDIA GPU with NVENC support + nvidia-docker runtime installed
+    #
+    # Uncomment the lines below to enable:
+    # ----------------------------------------------------------------------------
+    # runtime: nvidia
+    # environment:
+    #   - NVIDIA_VISIBLE_DEVICES=all
+    #   - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+    
+    # ============================================================================
+    # END HARDWARE ACCELERATION CONFIGURATION
+    # ============================================================================
+    
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8085}/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
