@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 # Application version
-VERSION = "0.2.29"
+VERSION = "0.2.36"
 
 
 class Settings(BaseSettings):
@@ -14,8 +14,9 @@ class Settings(BaseSettings):
     # Server Configuration
     HOST: str = "0.0.0.0"
     PORT: int = 8085
-    # Default public URL for re-writing URLs (HLS and Transcoded streams only)
-    PUBLIC_URL: Optional[str] = None
+    # DEPRECATED: PUBLIC_URL is no longer required. The proxy now uses relative URLs which
+    # work automatically with any reverse proxy setup.
+    # PUBLIC_URL: Optional[str] = None
     LOG_LEVEL: str = "error"
     APP_DEBUG: bool = False
     RELOAD: bool = False
@@ -41,6 +42,21 @@ class Settings(BaseSettings):
     DEFAULT_MAX_RETRIES: int = 3
     DEFAULT_BACKOFF_FACTOR: float = 1.5
     DEFAULT_HEALTH_CHECK_INTERVAL: float = 300.0
+
+    # HTTP Client Timeout Configuration for Streaming
+    # VOD (Video On Demand) timeout - allows clients to pause content for extended periods
+    VOD_READ_TIMEOUT: float = 300.0  # 5 minutes - allows upstream CDN stalls/re-buffering
+    VOD_WRITE_TIMEOUT: float = 3600.0  # 1 hour - allows client pause without losing session
+    # Live TV timeout - emphasizes keeping connection alive during client buffering
+    LIVE_TV_WRITE_TIMEOUT: float = 1800.0  # 30 minutes - safety net while supporting client backpressure
+
+    # Connection Idle Monitoring - detect and alert on long-held connections that may be resource leaks
+    # Alert threshold for connections held idle (warning log when exceeded)
+    CONNECTION_IDLE_ALERT_THRESHOLD: int = 600  # 10 minutes - emit WARNING when connection idle exceeds this
+    # Alert threshold for very long-held connections (error log)
+    CONNECTION_IDLE_ERROR_THRESHOLD: int = 1800  # 30 minutes - emit ERROR when connection idle exceeds this
+    # Enable connection idle monitoring (can be disabled for high-throughput scenarios)
+    ENABLE_CONNECTION_IDLE_MONITORING: bool = True
 
     # Additional configuration from .env file
     DEFAULT_RETRY_ATTEMPTS: int = 3

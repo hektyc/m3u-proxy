@@ -15,6 +15,7 @@ class TestHelperFunctions:
 
     def test_get_content_type(self):
         assert get_content_type("test.ts") == "video/mp2t"
+        assert get_content_type("test?profile=pass") == "video/mp2t"
         assert get_content_type(
             "playlist.m3u8") == "application/vnd.apple.mpegurl"
         assert get_content_type("video.mp4") == "video/mp4"

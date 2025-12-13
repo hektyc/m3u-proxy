@@ -49,7 +49,7 @@ def get_ffmpeg_version() -> Optional[str]:
 def get_content_type(url: str) -> str:
     """Determine content type based on URL extension"""
     url_lower = url.lower()
-    if url_lower.endswith('.ts'):
+    if url_lower.endswith(('.ts', '?profile=pass')):
         return 'video/mp2t'
     elif url_lower.endswith('.m3u8'):
         return 'application/vnd.apple.mpegurl'
@@ -67,7 +67,7 @@ def get_content_type(url: str) -> str:
 
 def is_direct_stream(url: str) -> bool:
     """Check if URL is a direct stream (not HLS playlist)"""
-    return url.lower().endswith(('.ts', '.mp4', '.mkv', '.webm', '.avi'))
+    return url.lower().endswith(('.ts', '.mp4', '.mkv', '.webm', '.avi', '?profile=pass')) or '/live/' in url
 
 
 def detect_https_from_headers(request: Request) -> bool:
@@ -226,6 +226,7 @@ def validate_url(url: str) -> str:
 class StreamCreateRequest(BaseModel):
     url: str
     failover_urls: Optional[List[str]] = None
+    failover_resolver_url: Optional[str] = None
     user_agent: Optional[str] = None
     metadata: Optional[dict] = None
     headers: Optional[Dict[str, str]] = None
@@ -242,6 +243,13 @@ class StreamCreateRequest(BaseModel):
     def validate_failover_urls(cls, v):
         if v is not None:
             return [validate_url(url) for url in v]
+        return v
+
+    @field_validator('failover_resolver_url')
+    @classmethod
+    def validate_failover_resolver_url(cls, v):
+        if v is not None:
+            return validate_url(v)
         return v
 
     @field_validator('metadata')
@@ -266,6 +274,7 @@ class StreamCreateRequest(BaseModel):
 class TranscodeCreateRequest(BaseModel):
     url: str
     failover_urls: Optional[List[str]] = None
+    failover_resolver_url: Optional[str] = None
     user_agent: Optional[str] = None
     metadata: Optional[dict] = None
     profile: Optional[str] = None  # Profile name or custom template
@@ -282,6 +291,13 @@ class TranscodeCreateRequest(BaseModel):
     def validate_failover_urls(cls, v):
         if v is not None:
             return [validate_url(url) for url in v]
+        return v
+
+    @field_validator('failover_resolver_url')
+    @classmethod
+    def validate_failover_resolver_url(cls, v):
+        if v is not None:
+            return validate_url(v)
         return v
 
     @field_validator('metadata')
@@ -372,9 +388,27 @@ static_path = os.path.join(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))), "static")
 # If static directory doesn't exist in the expected location, try the actual root
 if not os.path.exists(static_path):
-    static_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Fallback to /app/static for Docker or current working directory
+    static_path = os.path.join(os.getcwd(), "static")
+    if not os.path.exists(static_path):
+        # Last resort: try parent directory
+        static_path = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
 
-app.mount("/static", StaticFiles(directory=static_path), name="static")
+# Verify static path exists and log it
+if os.path.exists(static_path):
+    logger.info(f"✅ Static files directory found: {static_path}")
+    # List files in static directory for debugging
+    try:
+        static_files = os.listdir(static_path)
+        logger.info(f"📁 Static files available: {', '.join(static_files)}")
+    except Exception as e:
+        logger.warning(f"Could not list static directory: {e}")
+else:
+    logger.error(f"❌ Static files directory NOT found at: {static_path}")
+    logger.error(f"Current working directory: {os.getcwd()}")
+    logger.error(
+        f"Script directory: {os.path.dirname(os.path.abspath(__file__))}")
 
 # Configure CORS to allow all origins for streaming compatibility
 app.add_middleware(
@@ -438,6 +472,26 @@ async def custom_swagger_ui_html():
     """)
 
 
+# Serve static files explicitly (works with root_path)
+@app.get("/static/{filename:path}", include_in_schema=False)
+async def serve_static_file(filename: str):
+    """Serve static files like logo and favicon"""
+    file_path = os.path.join(static_path, filename)
+    if os.path.exists(file_path) and os.path.isfile(file_path):
+        # Determine media type based on extension
+        if filename.endswith('.svg'):
+            media_type = 'image/svg+xml'
+        elif filename.endswith('.png'):
+            media_type = 'image/png'
+        elif filename.endswith('.ico'):
+            media_type = 'image/x-icon'
+        else:
+            media_type = None
+        return FileResponse(file_path, media_type=media_type)
+    raise HTTPException(
+        status_code=404, detail=f"Static file not found: {filename}")
+
+
 # Serve favicon directly at root for browsers
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
@@ -466,9 +520,13 @@ def get_client_info(request: Request):
         # Fallback to direct connection IP
         ip_address = request.client.host
 
+    # Get username from X-Username header (set by m3u-editor for auth tracking)
+    username = request.headers.get("x-username")
+
     return {
         "user_agent": request.headers.get("user-agent") or "unknown",
-        "ip_address": ip_address
+        "ip_address": ip_address,
+        "username": username
     }
 
 
@@ -617,6 +675,7 @@ async def create_stream(request: StreamCreateRequest):
         stream_id = await stream_manager.get_or_create_stream(
             request.url,
             request.failover_urls,
+            request.failover_resolver_url,
             request.user_agent,
             metadata=request.metadata,
             headers=request.headers,
@@ -728,6 +787,7 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
         stream_id = await stream_manager.get_or_create_stream(
             request.url,
             request.failover_urls,
+            request.failover_resolver_url,
             request.user_agent,
             metadata=transcoding_metadata,
             is_transcoded=True,
@@ -875,7 +935,8 @@ async def get_hls_playlist(
                 client_id,
                 stream_id,
                 user_agent=client_info_data["user_agent"],
-                ip_address=client_info_data["ip_address"]
+                ip_address=client_info_data["ip_address"],
+                username=client_info_data.get("username")
             )
 
             # Emit client connected event
@@ -885,7 +946,8 @@ async def get_hls_playlist(
                 data={
                     "client_id": client_id,
                     "user_agent": client_info_data["user_agent"],
-                    "ip_address": client_info_data["ip_address"]
+                    "ip_address": client_info_data["ip_address"],
+                    "username": client_info_data.get("username")
                 }
             )
             await event_manager.emit_event(event)
@@ -893,72 +955,26 @@ async def get_hls_playlist(
             logger.debug(
                 f"Reusing existing client {client_id} for stream {stream_id}")
 
-        # Build base URL for this stream using settings.PUBLIC_URL (optional) and settings.PORT
-        # PUBLIC_URL may be an IP, domain, or include a scheme (http/https) and/or port.
-        public_url = getattr(settings, 'PUBLIC_URL', None)
-        port = getattr(settings, 'PORT', None) or 8085
+        # Build base URL for playlist rewriting using RELATIVE URLs
+        # This eliminates the need for PUBLIC_URL and works with ANY reverse proxy setup.
+        # The client's browser will automatically resolve relative URLs using the same
+        # host/scheme they used to access this endpoint.
+        #
+        # For example:
+        #   - User accesses: https://example.com/m3u-proxy/hls/stream_id/playlist.m3u8
+        #   - Relative URL: /m3u-proxy/hls/stream_id/segment?url=...
+        #   - Browser resolves to: https://example.com/m3u-proxy/hls/stream_id/segment?url=...
+        #
+        # This works for:
+        #   - Direct access (http://localhost:8085/...)
+        #   - NGINX reverse proxy (https://example.com/m3u-proxy/...)
+        #   - Any reverse proxy (Caddy, Traefik, AWS ELB, etc.)
+        #   - VPN/Tailscale access (https://host.vpn.ts.net/m3u-proxy/...)
         root_path = getattr(settings, 'ROOT_PATH', '')
 
-        if public_url:
-            # If PUBLIC_URL includes a scheme, respect it. Otherwise assume http.
-            public_with_scheme = public_url if public_url.startswith(
-                ('http://', 'https://')) else f"http://{public_url}"
-            parsed = urlparse(public_with_scheme)
-            scheme = parsed.scheme or 'http'
-
-            # ✅ UNIVERSAL FIX: Auto-detect HTTPS from reverse proxy headers
-            # This works with ALL major reverse proxies without requiring user configuration
-            https_detected = detect_https_from_headers(request)
-            if https_detected:
-                scheme = "https"
-
-            # Detect if request is coming through ANY reverse proxy (HTTP or HTTPS)
-            reverse_proxy_detected = detect_reverse_proxy(request)
-
-            # Preserve hostname and path. If PUBLIC_URL provided an explicit port, use it;
-            # otherwise fall back to settings.PORT when available.
-            host = parsed.hostname or ''
-            url_port = parsed.port
-            path = parsed.path or ''
-
-            # If ROOT_PATH is already included in the PUBLIC_URL path, remove it to prevent duplication
-            # We'll add it back later to ensure it's always present in the final URL
-            if root_path and path.startswith(root_path):
-                path = path[len(root_path):]
-
-            # ✅ FIX: When reverse proxy is detected, don't add internal port
-            # The reverse proxy handles the external port (443 for HTTPS, 80 for HTTP)
-            # Only use the internal port (8085) when:
-            # 1. PUBLIC_URL explicitly includes a port, OR
-            # 2. No reverse proxy is detected (direct access)
-            if url_port:
-                # PUBLIC_URL explicitly includes a port - respect it
-                netloc = f"{host}:{url_port}"
-            elif reverse_proxy_detected:
-                # Reverse proxy detected (HTTP or HTTPS) - use hostname only
-                # The reverse proxy handles the external port mapping
-                netloc = host
-            elif port and port != 80:
-                # Direct access with non-standard port - include port
-                netloc = f"{host}:{port}"
-            else:
-                # Direct access with standard port 80 or no port specified
-                netloc = host
-
-            # Combine scheme, netloc, and any path from PUBLIC_URL (preserve sub-paths)
-            base = f"{scheme}://{netloc}{path.rstrip('/')}"
-
-            # Add ROOT_PATH back to ensure segment URLs include the correct prefix for NGINX routing
-            if root_path:
-                base = f"{base}{root_path}"
-        else:
-            # Default to localhost with configured port (or 8085)
-            base = f"http://localhost:{port}"
-            # Add ROOT_PATH if configured
-            if root_path:
-                base = f"{base}{root_path}"
-
-        base_proxy_url = f"{base.rstrip('/')}/hls/{stream_id}"
+        # Use relative URLs (just the path, no scheme/host)
+        # This automatically works with whatever host/scheme the client used
+        base_proxy_url = f"{root_path}/hls/{stream_id}"
 
         # Get processed playlist content (works for both direct HLS and transcoded HLS)
         content = await stream_manager.get_playlist_content(stream_id, client_id, base_proxy_url)
@@ -1044,7 +1060,8 @@ async def get_hls_segment(
             client_id,
             stream_id,  # Use the parent HLS stream ID
             user_agent=client_info_data["user_agent"],
-            ip_address=client_info_data["ip_address"]
+            ip_address=client_info_data["ip_address"],
+            username=client_info_data.get("username")
         )
 
         # For HLS segments, we need to fetch the segment directly without creating a separate stream
@@ -1115,10 +1132,11 @@ async def get_direct_stream(
                 client_id,
                 stream_id,
                 user_agent=client_info_data["user_agent"],
-                ip_address=client_info_data["ip_address"]
+                ip_address=client_info_data["ip_address"],
+                username=client_info_data.get("username")
             )
             logger.info(
-                f"Registered client {client_id} for stream {stream_id}")
+                f"Registered client {client_id} for stream {stream_id}" + (f" (username: {client_info_data.get('username')})" if client_info_data.get('username') else ""))
         else:
             logger.debug(
                 f"Reusing existing client {client_id} for stream {stream_id}")
@@ -1558,14 +1576,17 @@ async def trigger_failover(stream_id: str):
 
         stream_info = stream_manager.streams[stream_id]
 
-        if not stream_info.failover_urls:
+        # Check if any failover mechanism is available
+        has_failovers = bool(
+            stream_info.failover_resolver_url or stream_info.failover_urls)
+        if not has_failovers:
             raise HTTPException(
                 status_code=400,
-                detail="No failover URLs configured for this stream"
+                detail="No failover mechanism configured for this stream (neither failover_urls nor failover_resolver_url)"
             )
 
         # Trigger failover which will:
-        # 1. Update current_url to next failover URL
+        # 1. Update current_url to next failover URL (via resolver or array)
         # 2. Signal all active clients via failover_event
         # 3. For transcoded streams, restart FFmpeg with new URL
         # 4. Emit FAILOVER_TRIGGERED event
@@ -1602,9 +1623,14 @@ async def health_check():
     try:
         stats = stream_manager.get_stats()
         proxy_stats = stats["proxy_stats"]
+        # Note: PUBLIC_URL is now deprecated in favor of relative URLs.
+        # The proxy returns null if not configured (which is now the norm).
+
+        # Get the host accessing this endpoint from request headers and use as the public URL
+
         return {
             "status": "healthy",
-            "public_url": settings.PUBLIC_URL,
+            "root_path": getattr(settings, 'ROOT_PATH', '/m3u-proxy'),
             "version": VERSION,
             "uptime_seconds": proxy_stats["uptime_seconds"],
             "active_streams": proxy_stats["active_streams"],
@@ -1618,6 +1644,67 @@ async def health_check():
             "status": "error",
             "error": str(e)
         }, 500
+
+
+class TestConnectionRequest(BaseModel):
+    """Request model for testing connectivity to an external URL"""
+    url: str
+
+
+@app.post("/test-connection", dependencies=[Depends(verify_token)])
+async def test_url_connectivity(request: TestConnectionRequest):
+    """
+    Test connectivity to an external URL by calling it from the proxy to verify connectivity.
+    This is used to verify the proxy can reach external services for failover resolution.
+    """
+    import httpx
+
+    # Ensure URL doesn't have trailing slash
+    test_url = request.url.rstrip('/')
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(test_url)
+
+            if response.status_code == 200:
+                return {
+                    "success": True,
+                    "message": f"Successfully connected to {test_url}",
+                    "status_code": response.status_code,
+                    "url_tested": test_url
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": f"URL returned non-200 status code",
+                    "status_code": response.status_code,
+                    "url_tested": test_url
+                }
+    except httpx.ConnectError as e:
+        logger.warning(f"Connection error testing URL {test_url}: {e}")
+        return {
+            "success": False,
+            "message": f"Connection failed: Unable to connect to {request.url}",
+            "error": str(e),
+            "url_tested": test_url
+        }
+    except httpx.TimeoutException as e:
+        logger.warning(f"Timeout testing URL {test_url}: {e}")
+        return {
+            "success": False,
+            "message": f"Connection timed out after 10 seconds",
+            "error": str(e),
+            "url_tested": test_url
+        }
+    except Exception as e:
+        logger.error(f"Error testing URL {test_url}: {e}")
+        return {
+            "success": False,
+            "message": f"Error testing connection: {str(e)}",
+            "error": str(e),
+            "url_tested": test_url
+        }
+
 
 # Webhook Management Endpoints
 
